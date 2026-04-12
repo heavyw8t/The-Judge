@@ -6,7 +6,7 @@ description: "The Judge — filter AI-generated web3 security findings for false
 # Validate-Issue — Web3 Security Issue Validation Pipeline
 
 > **Purpose**: Determine whether a web3 security issue report is valid, invalid, or should be severity-adjusted through a 4-step adversarial process with early exits.
-> **Models**: opus for checkers/generator/judge, sonnet for selector.
+> **Models**: opus for generator/adversarial checkers (4B)/judge, sonnet for selector/generic checkers (3B)/mitigation check (2.5)/external research (1.5).
 
 ---
 
@@ -22,11 +22,11 @@ MODE SELECTION → PRE-STEP (once)
 Per-issue pipeline:
   STEP 1 (sweep) → STEP 2 (roles)
     ↓
-  WAVE 1:  [STEP 1.5  ∥  STEP 3A  ∥  STEP 4A]            (research + selector + generator)
+  WAVE 1:  [STEP 1.5  ∥  STEP 2.5  ∥  STEP 3A  ∥  STEP 4A]  (research + mitigation + selector + generator)
     ↓
   Orchestrator filters Step 4A reasons against Step 3A selections (drop duplicates)
     ↓
-  WAVE 2:  [STEP 3B (3 opus) + STEP 4B (3 opus)]         (6 parallel checkers, ONE message)
+  WAVE 2:  [STEP 3B (2 sonnet) + STEP 4B (2 opus)]       (4 parallel checkers, ONE message)
     ↓
   STEP 3C: orchestrator confirms — EARLY EXIT if ≥2 Step 3B checkers HOLDS
     ↓
@@ -35,7 +35,7 @@ Per-issue pipeline:
   OUTPUT
 ```
 
-Each step can EARLY EXIT with a verdict at Steps 1, 2, or 3C.
+Each step can EARLY EXIT with a verdict at Steps 1, 2, or 3C. Step 2.5 runs in background and can cap severity if the issue is a design trade-off.
 
 ---
 
@@ -73,14 +73,127 @@ Options:
 
 **This step runs once for the whole session, before the per-issue loop. Context collected here is shared across all issues.**
 
-Collect three inputs using the two-round pattern described below for each. This pattern eliminates the path input bug — never offer "Enter path below" as a predefined option; always use the "Other" field mechanism to capture typed paths and URLs.
+### Session Reuse Check
 
-**The Two-Round Input Pattern (use for each item A, B, C below):**
+Before collecting anything, check if `.validation_context/` already exists in the working directory with valid summaries from a prior run:
+
+1. Check if all four files exist: `docs_summary.md`, `roles_summary.md`, `scope_summary.md`, `external_integrations.md` in `.validation_context/`.
+2. If ALL four exist and are non-empty:
+   - Read each file and display a compact preview (first 3 lines of each).
+   - Use `AskUserQuestion`:
+     > "Found existing validation context from a prior session. What would you like to do?"
+     Options: `Reuse as-is` | `Reuse but let me update some fields` | `Start fresh — re-detect everything`
+   - **"Reuse as-is"**: Load all four files into their variables (Section E below) and skip directly to **E. Variable Assignments**. Print: "Reusing existing context."
+   - **"Reuse but let me update some fields"**: Load all four files, then use `AskUserQuestion`:
+     > "Which fields do you want to update?"
+     Options: `Docs` | `Roles` | `Scope` | `Multiple / all of them`
+     Run ONLY the selected section(s) (A, B, and/or C below) using the standard flow. Keep the rest as-is.
+   - **"Start fresh"**: Proceed to auto-detection below as if no context exists.
+3. If any file is missing or empty → proceed to auto-detection (no prompt needed).
+
+### Auto-Detection Phase
+
+Before prompting the user for anything, scan the working directory to auto-detect docs, roles, and scope. This runs silently and populates `AUTO_DOCS`, `AUTO_ROLES`, and `AUTO_SCOPE` candidates.
+
+**Auto-detect documentation** — search for common doc files in priority order (stop at first hit per category):
+
+| Priority | Glob Pattern | Notes |
+|----------|-------------|-------|
+| 1 | `**/WHITEPAPER.md`, `**/whitepaper.md` | Dedicated whitepaper |
+| 2 | `**/SPEC.md`, `**/spec.md`, `**/SPECIFICATION.md` | Formal spec |
+| 3 | `**/DESIGN.md`, `**/design.md`, `**/ARCHITECTURE.md` | Design doc |
+| 4 | `**/docs/README.md`, `**/docs/overview.md`, `**/docs/protocol.md` | Docs folder |
+| 5 | `**/README.md` (root only — not nested in node_modules/lib) | Project readme |
+| 6 | `**/*.pdf` (exclude `node_modules/`, `lib/`, `.git/`) | PDF docs |
+
+Collect ALL hits (not just first). Set `AUTO_DOCS = list of {path, priority}`. If no hits → `AUTO_DOCS = []`.
+
+**Auto-detect scope** — look for explicit scope files and common contract directories:
+
+| Priority | Pattern | Interpretation |
+|----------|---------|---------------|
+| 1 | `**/scope.txt`, `**/scope.md`, `**/SCOPE.md`, `**/scope.json` | Explicit scope file |
+| 2 | `**/audit-scope.md`, `**/audit_scope.md` | Audit scope file |
+| 3 | `foundry.toml` → read `src` field; `hardhat.config.*` → read `paths.sources` | Build config points to source dir |
+| 4 | `**/src/**/*.sol`, `**/contracts/**/*.sol` | Standard Solidity source dirs |
+| 5 | `**/*.sol` excluding `node_modules/`, `lib/`, `test/`, `tests/`, `script/`, `scripts/`, `mock/`, `mocks/` | All non-test Solidity files |
+| 6 | `**/programs/*/src/**/*.rs` (Anchor), `**/*.move` (Aptos/Sui) | Non-EVM source patterns |
+
+Set `AUTO_SCOPE_FILE` = first hit from priorities 1-2 (explicit scope file), or `null`.
+Set `AUTO_SCOPE_FILES` = resolved file list from priorities 3-6.
+Detect language: if `.sol` files found → `LANG = solidity`; if `.rs` + `Anchor.toml` → `LANG = solana`; if `.move` + `Move.toml` → `LANG = move`. Adjust Glob patterns in scope resolution and later steps accordingly.
+
+**Auto-detect roles** — look for role/trust files:
+
+| Priority | Pattern |
+|----------|---------|
+| 1 | `**/roles.md`, `**/ROLES.md`, `**/trust.md`, `**/TRUST.md` |
+| 2 | `**/access-control.md`, `**/access_control.md` |
+
+Set `AUTO_ROLES = first hit path` or `null`.
+
+### User Confirmation (per-field, always required)
+
+Auto-detection results MUST be confirmed by the user for each field. Present each detected value and offer an override. This runs as three sequential confirmations (one per field), keeping each focused.
+
+**Confirm Docs:**
+
+If `AUTO_DOCS` is non-empty, show the top hit(s) and ask:
+> "Auto-detected documentation:\n{list of AUTO_DOCS paths, one per line}\n\nIs this correct?"
+Options: `Yes — use {AUTO_DOCS[0].path}` | `Use a different file / URL` | `I'll describe it as free text` | `Skip — no docs`
+
+- **"Yes"**: `DOCS_RAW` = concatenated content of `AUTO_DOCS` files (read each, cap total at 10000 words).
+- **"Use a different file / URL"**: Apply the Two-Round Input Pattern (Round 2 below) to get the path/URL. Read/fetch it into `DOCS_RAW`.
+- **"Free text"**: `AskUserQuestion` to ask user to describe protocol mechanics. Store as `DOCS_RAW`.
+- **"Skip"**: `DOCS_RAW = "No documentation provided."`
+
+If `AUTO_DOCS` is empty:
+> "No documentation files auto-detected. Do you have protocol documentation?"
+Options: `I have a file path or URL` | `I'll describe it as free text` | `Skip — no docs`
+Handle as above.
+
+**Confirm Scope:**
+
+If `AUTO_SCOPE_FILE` is found, show it:
+> "Auto-detected scope file: `{AUTO_SCOPE_FILE}`\n\nIs this correct?"
+Options: `Yes — use this scope file` | `Use a different file` | `I'll list them as free text` | `Skip — use all {N} detected source files`
+
+If no explicit scope file but `AUTO_SCOPE_FILES` is non-empty:
+> "No explicit scope file found, but detected {N} source files in `{directories}`:\n{first 10 files, then '... and N more' if >10}\n\nIs this the correct scope?"
+Options: `Yes — use these {N} files` | `Use a scope file instead` | `I'll list the in-scope files` | `Let me adjust the list`
+
+- **"Yes"**: Use `AUTO_SCOPE_FILE` content as `SCOPE_RAW`, or set `SCOPE_FILES = AUTO_SCOPE_FILES` directly.
+- **"Use a different/scope file"**: Apply Two-Round Input Pattern. Store as `SCOPE_RAW`.
+- **"Free text" / "List"**: `AskUserQuestion` to ask user to list contracts. Store as `SCOPE_RAW`.
+- **"Skip"**: `SCOPE_FILES` = all detected source files. `SCOPE_RAW = null`.
+- **"Adjust"**: `AskUserQuestion`: "List the files to ADD or REMOVE (prefix with - to remove)." Apply edits to `AUTO_SCOPE_FILES`.
+
+If nothing found:
+> "No source files detected in the working directory. Do you have a scope file or file list?"
+Options: `I have a file path or URL` | `I'll list them as free text` | `Skip — text-only analysis`
+
+**Confirm Roles:**
+
+If `AUTO_ROLES` is found:
+> "Auto-detected role/trust file: `{AUTO_ROLES}`\n\nIs this correct?"
+Options: `Yes — use this file` | `Use a different file` | `I'll describe roles as free text` | `Skip — no role file`
+
+If not found:
+> "No role trust file auto-detected. Do you have one?"
+Options: `I have a file path or URL` | `I'll describe roles as free text` | `Skip — no role file`
+
+Handle identically to the manual flow for each response.
+
+**After all three confirmations**, proceed to **D. Summarization**.
+
+### Manual Input Flow (for fields not auto-detected or user wants to override)
+
+**The Two-Round Input Pattern (use for each item below when manual input is needed):**
 - **Round 1**: AskUserQuestion asking what format they have, with options: `None / skip` | `I'll describe it as free text` | `I have a file path or URL`
 - **If "I have a file path or URL"** → **Round 2**: AskUserQuestion with the prompt "Type the file path or URL in the 'Other' field below, then submit." Options: `["None — skip after all"]`. Whatever text is in the "Other" field = the path/URL. If the "Other" field is empty, re-prompt once; if still empty, treat as "None / skip".
 - **If file path**: use `Read`. **If URL**: use `WebFetch`. On failure: warn user, set content to the fallback string.
 
-**A. Protocol Documentation**
+**A. Protocol Documentation** (manual)
 
 Round 1: "Do you have protocol documentation for this protocol?"
 Options: `None / skip` | `I'll describe it as free text` | `I have a file path or URL`
@@ -89,29 +202,32 @@ Options: `None / skip` | `I'll describe it as free text` | `I have a file path o
 - Free text → `AskUserQuestion` to ask user to describe protocol mechanics. Store response as `DOCS_RAW`.
 - File/URL → Apply two-round pattern. Store loaded content as `DOCS_RAW`. On failure → `DOCS_RAW = "Docs fetch failed."`
 
-**B. Role Trust File**
+**B. Role Trust File** (manual)
 
 Round 1: "Do you have a file describing privileged roles and their trust levels?"
 Options: `None / skip` | `I'll describe it as free text` | `I have a file path or URL`
 
 Same pattern. Store as `ROLE_TRUST_RAW`. Fallback: `"No role trust file provided."` / `"Role trust file not readable."`
 
-**C. Audit Scope**
+**C. Audit Scope** (manual)
 
 Round 1: "Do you have an audit scope file listing in-scope contracts?"
-Options: `None / skip — treat all .sol files as in scope` | `I'll list them as free text` | `I have a file path or URL`
+Options: `None / skip — treat all source files as in scope` | `I'll list them as free text` | `I have a file path or URL`
 
 Same pattern. Store as `SCOPE_RAW`.
 
-After loading `SCOPE_RAW`:
-- Use `Glob("**/*.sol")` (and `**/*.vy` if Vyper) to find all source files in the working directory.
-- If "None / skip": `SCOPE_FILES` = all found .sol files.
-- If text or file was provided: match the contract names/paths listed in `SCOPE_RAW` against the Glob results. `SCOPE_FILES` = resolved matches. Warn on any listed name not found (non-fatal).
+### Scope Resolution (runs regardless of auto vs manual)
+
+After `SCOPE_RAW` and/or `AUTO_SCOPE_FILES` are set:
+- Detect language if not already detected: Use `Glob("**/*.sol")`, `Glob("**/*.vy")`, `Glob("**/programs/*/src/**/*.rs")`, `Glob("**/*.move")` to find source files.
+- If `SCOPE_RAW` is set (from explicit scope file or user input): match the contract names/paths listed in `SCOPE_RAW` against the Glob results. `SCOPE_FILES` = resolved matches. Warn on any listed name not found (non-fatal).
+- If `SCOPE_RAW` is `null` and `AUTO_SCOPE_FILES` is populated: `SCOPE_FILES` = `AUTO_SCOPE_FILES`.
+- If neither: `SCOPE_FILES` = all found source files (`.sol`, `.vy`, `.rs`, `.move`).
 - If `SCOPE_FILES` is empty → warn: "No source files found in working directory. Text-only analysis will be used."
 
 **D. Summarization**
 
-After collecting all three inputs, write summarized versions to `.validation_context/` in the working directory. Create the directory if needed (`mkdir -p .validation_context`).
+After all inputs are resolved, write summarized versions to `.validation_context/` in the working directory. Create the directory if needed (`mkdir -p .validation_context`).
 
 **1. `.validation_context/docs_summary.md`** (max 1000 words)
 Summarize `DOCS_RAW` covering: protocol purpose, core mechanics, key invariants, security-relevant behaviors.
@@ -241,7 +357,7 @@ SCOPE: One issue, one output file, return and stop.
 
 - Issues in the SAME batch do not see each other's notes or cache updates. This is acceptable: `BATCH_NOTES` is non-authoritative by design (the rule below), and the cache only affects *later* batches.
 - BATCH_NOTES rule: BATCH_NOTES contains observations and context hints from prior issues — **NOT verdicts**. Do NOT treat a prior note that says an issue is valid/invalid as authoritative. Re-verify any factual claim in BATCH_NOTES against the actual code before relying on it.
-- Each per-issue subagent itself spawns 4–7 opus subagents during its run. At BATCH_SIZE=5 you have ~25–35 opus agents in flight simultaneously. Reduce BATCH_SIZE if you hit rate limits.
+- Each per-issue subagent itself spawns ~7 subagents (4 sonnet + 3 opus worst case). At BATCH_SIZE=5 you have ~15 opus + ~20 sonnet agents in flight simultaneously. Reduce BATCH_SIZE if you hit rate limits.
 
 ---
 
@@ -356,35 +472,106 @@ Scan `ISSUE_TEXT` for mentions of these roles in the **attack path** (not just m
      - `operator`, `keeper`, `guardian`, `manager`, `deployer` = **SEMI-TRUSTED** (flag but don't auto-downgrade)
 
 2. **If role is TRUSTED and attack requires it to act maliciously**:
-   - Set `MAX_SEVERITY = Low`
+   - Set `MAX_SEVERITY = Informational`
    - Set `DOWNGRADE_REASON = "Attack requires trusted role [{role}] to act maliciously."`
    - **CRITICAL DISTINCTION**: Only apply this cap when the vulnerability REQUIRES the trusted role to take a deliberate harmful action. Do NOT apply if:
      - The trusted role makes a legitimate, correct administrative call but the code behaves unexpectedly (that is a code bug, not admin abuse)
      - The issue is about unexpected protocol behavior triggered by normal admin operations
      - The harm falls on users without any malicious intent from the admin
 
-3. **EARLY EXIT**: Only if the ENTIRE issue reduces to "trusted role can rug/steal" with no other dimension (no external precondition manipulation, no path via non-privileged actor). In this case → `INVALID` or `Low` with justification. Jump to **OUTPUT** with `EXIT_STEP = 2`.
+3. **EARLY EXIT**: Only if the ENTIRE issue reduces to "trusted role can rug/steal" with no other dimension (no external precondition manipulation, no path via non-privileged actor). In this case → `INVALID` or `Informational` with justification. Jump to **OUTPUT** with `EXIT_STEP = 2`.
 
 4. If role is SEMI-TRUSTED or issue has additional dimensions beyond role abuse → continue to Step 3 (with `MAX_SEVERITY` cap applied if set).
 
-**After Step 2 completes without early exit → launch WAVE 1 (Step 1.5, Step 3A, and Step 4A) in parallel in a SINGLE message. Do not wait for any one before starting the others. Wave 1 wall clock is bounded by the slowest of the three (typically Step 4A opus generator, ~1.5 min).**
+**After Step 2 completes without early exit → launch WAVE 1 (Step 1.5, Step 2.5, Step 3A, and Step 4A) in parallel in a SINGLE message. Do not wait for any one before starting the others. Wave 1 wall clock is bounded by the slowest of the four (typically Step 4A opus generator, ~1.5 min).**
 
 ---
 
-## STEP 3: Generic Invalidation Check (1 selector + 3 checkers)
+## STEP 2.5: Mitigation Viability Check (Wave 1, background)
+
+> **Wave 1**: launched in parallel with Steps 1.5, 3A, and 4A immediately after Step 2 completes. Runs as a background agent — does NOT block the pipeline.
+
+**Purpose**: Determine whether the reported issue has a clean fix or represents an inherent design trade-off where any mitigation introduces equivalent downsides. Trade-off issues (where the cure is as costly as the disease) are capped at Low/Informational.
+
+**Mitigation extraction**: Scan `ISSUE_TEXT` for a recommended fix/mitigation section. Common markers: "Recommendation", "Mitigation", "Fix", "Remediation". Extract the mitigation text as `MITIGATION_TEXT`. If no mitigation is found in the report, set `MITIGATION_TEXT` to `"No mitigation was proposed in the report. Identify the most obvious fix for this vulnerability class."`.
+
+**Spawn agent**:
+
+```
+Agent(subagent_type="general-purpose", model="sonnet", run_in_background=true, prompt="
+You are a Mitigation Viability Checker.
+
+## Your Task
+Determine whether the security issue below has a clean fix, or whether it represents
+an inherent design trade-off where any mitigation introduces equivalent downsides.
+
+## Issue Report
+{ISSUE_TEXT}
+
+## Proposed Mitigation
+{MITIGATION_TEXT}
+
+## Protocol Documentation
+{DOCS_SUMMARY}
+
+## Audit Scope
+{SCOPE_SUMMARY}
+
+## Instructions
+1. Read the source code at the referenced location(s).
+2. If a mitigation was proposed, evaluate it. If not, identify the most natural fix
+   for this vulnerability class.
+3. Evaluate the mitigation:
+   - Does it fully resolve the root cause without introducing new problems of
+     comparable magnitude?
+   - Or does it create a trade-off of similar severity? Examples of trade-offs:
+     * Fixing front-running by adding commit-reveal that adds heavy UX friction
+     * Fixing griefing by adding a whitelist that centralizes control
+     * Fixing a rounding issue by adding precision that proportionally increases gas costs
+     * Fixing MEV by adding a delay that equally degrades user experience
+   - A trade-off means: the cure is roughly as costly/risky as the disease.
+4. These are NOT trade-offs (clean fixes with negligible downside):
+   - Standard input validation, access control checks, reentrancy guards
+   - Event emissions, proper error messages
+   - Bounds checking, overflow protection
+   - Correct arithmetic or ordering fixes
+
+## Output Format
+**Mitigation Evaluated**: {1-2 sentence description of the mitigation}
+**Verdict**: SOLVABLE / TRADE_OFF / UNCERTAIN
+**Confidence**: HIGH / MEDIUM / LOW
+**Reasoning**: {3-5 sentences explaining why this is solvable or a trade-off}
+**If TRADE_OFF, Suggested Severity**: Low / Informational
+**If TRADE_OFF, Downside of Fix**: {what the mitigation costs — the equivalent downside}
+
+SCOPE: Evaluate the mitigation only. Return verdict and stop.
+")
+```
+
+**Result variable**: Store the agent result as `MITIGATION_CHECK`. This is consumed in Step 4D / OUTPUT.
+
+**Result handling** (applied in Step 4D and OUTPUT Section A):
+- `TRADE_OFF` + HIGH confidence → apply `MAX_SEVERITY = max(Low, existing MAX_SEVERITY)` (cap at Low, but don't override a stricter cap from Step 2)
+- `TRADE_OFF` + MEDIUM confidence → inject into Step 4C judge prompt as advisory context (let the judge weigh it), no auto-cap
+- `SOLVABLE` or `UNCERTAIN` → no severity impact
+- Agent timeout or failure → treat as `UNCERTAIN`, no severity impact
+
+---
+
+## STEP 3: Generic Invalidation Check (1 selector + 2 checkers)
 
 ### 3A — Selector Agent
 
-> **Wave 1**: launched in parallel with Step 1.5 and Step 4A. Sonnet selector reads the invalidation library and picks 3 generic reasons. Does not depend on Step 1.5 or Step 4A output.
+> **Wave 1**: launched in parallel with Step 1.5 and Step 4A. Sonnet selector reads the invalidation library and picks 2 generic reasons. Does not depend on Step 1.5 or Step 4A output.
 
-Spawn one agent to select the 3 most applicable invalidation reasons:
+Spawn one agent to select the 2 most applicable invalidation reasons:
 
 ```
 Agent(subagent_type="general-purpose", model="sonnet", prompt="
 You are an Invalidation Selector Agent.
 
 ## Your Task
-Read the invalidation library below and select the 3 reasons MOST APPLICABLE to the
+Read the invalidation library below and select the 2 reasons MOST APPLICABLE to the
 security issue under review. Do NOT generate new reasons — only select from the library.
 
 ## Issue Report
@@ -403,13 +590,13 @@ security issue under review. Do NOT generate new reasons — only select from th
 {Read and paste the full content of ~/.claude/agents/skills/judge/references/invalidation-library.md}
 
 ## Output Format
-For each of your 3 selections:
+For each of your 2 selections:
 ### Selection {N}
 - **ID**: {e.g., CP-2}
 - **Title**: {from library}
 - **Why this applies**: {2-3 sentences explaining why this specific reason is relevant to THIS issue}
 
-SCOPE: Select 3 reasons from the library. Do NOT verify them against code. Return selections and stop.
+SCOPE: Select 2 reasons from the library. Do NOT verify them against code. Return selections and stop.
 ")
 ```
 
@@ -417,14 +604,14 @@ SCOPE: Select 3 reasons from the library. Do NOT verify them against code. Retur
 
 **After WAVE 1 completes** (Steps 1.5, 3A, and 4A have all returned):
 
-1. **Filter Step 4A's reasons against Step 3A's selections.** For each reason from Step 4A, compare against Step 3A's 3 selections. Drop any reason whose mechanism falls into the same vulnerability category as a Step 3A selection (e.g., "missing slippage check" overlaps with library entry CP-2 "input validation"). Keep up to 3 surviving reasons, ranked by the generator's confidence. If Step 4A produced fewer than 3 unique surviving reasons, proceed with what remains (Wave 2 may have <6 agents).
+1. **Filter Step 4A's reasons against Step 3A's selections.** For each reason from Step 4A, compare against Step 3A's 2 selections. Drop any reason whose mechanism falls into the same vulnerability category as a Step 3A selection (e.g., "missing slippage check" overlaps with library entry CP-2 "input validation"). Keep up to 2 surviving reasons, ranked by the generator's confidence. If Step 4A produced fewer than 2 unique surviving reasons, proceed with what remains (Wave 2 may have <4 agents).
 
-2. **Launch WAVE 2 in a SINGLE message**: spawn 3 Step 3B checkers (one per Step 3A selection) AND up to 3 Step 4B checkers (one per surviving Step 4A reason) — up to 6 opus agents in parallel.
+2. **Launch WAVE 2 in a SINGLE message**: spawn 2 Step 3B checkers (one per Step 3A selection, sonnet) AND up to 2 Step 4B checkers (one per surviving Step 4A reason, opus) — up to 4 agents in parallel.
 
 Step 3B agents use this prompt (one agent per selected reason):
 
 ```
-Agent(subagent_type="general-purpose", model="opus", prompt="
+Agent(subagent_type="general-purpose", model="sonnet", prompt="
 You are an Invalidation Checker Agent.
 
 ## Your Task
@@ -480,30 +667,31 @@ SCOPE: Check ONLY this one invalidation reason. Return your verdict and stop.
 
 > **Note**: by the time Step 3C runs, WAVE 2 has fully completed — both Step 3B and Step 4B checker outputs are already available. Step 3C operates ONLY on Step 3B's results. If Step 3C triggers an early exit, Step 4B's results are discarded (Step 4C judge is skipped, saving ~1.5 min). If no early exit, Step 4B's results are consumed by Step 4C.
 
-**EARLY EXIT requires AT LEAST 2 of the 3 Step 3B checkers to return `HOLDS`** (a single HOLDS is not sufficient — this prevents false negatives from isolated checker mistakes).
+**EARLY EXIT requires BOTH Step 3B checkers to return `HOLDS`** (unanimous agreement — this prevents false negatives from a single checker mistake).
 
-If at least 2 Step 3B checkers returned `HOLDS`:
+If both Step 3B checkers returned `HOLDS`:
 1. Read each holding checker's evidence and explanation.
 2. Use `Read` to independently verify the cited code references.
-3. If the evidence from at least 2 checkers is solid and the logic is sound → **EARLY EXIT**: set verdict to `INVALID` or `DOWNGRADED` based on `Severity Impact`. Discard Step 4B results entirely. Jump to **OUTPUT** with `EXIT_STEP = 3`.
-4. If a checker's evidence is weak or has a logical flaw → discard that invalidation, note it as `OVERRULED` in the pipeline trace. Early exit only if 2+ remain confirmed after overrule.
+3. If BOTH checkers' evidence is solid and the logic is sound → **EARLY EXIT**: set verdict to `INVALID` or `DOWNGRADED` based on `Severity Impact`. Discard Step 4B results entirely. Jump to **OUTPUT** with `EXIT_STEP = 3`.
+4. If EITHER checker's evidence is weak or has a logical flaw → discard that invalidation, note it as `OVERRULED` in the pipeline trace. With 2 checkers, any overrule breaks unanimity — no early exit.
 
-If fewer than 2 Step 3B checkers returned `HOLDS` (or insufficient confirmed after overrule) → consume Step 4B results and proceed to Step 4C.
+If fewer than 2 Step 3B checkers returned `HOLDS` (or unanimity broken by overrule) → consume Step 4B results and proceed to Step 4C.
 
 ---
 
-## STEP 4: Issue-Specific Adversarial Check (1 generator + 3 checkers + 1 judge)
+## STEP 4: Issue-Specific Adversarial Check (1 generator + 2 checkers + 1 judge)
 
 ### 4A — Generator Agent
 
-> **Wave 1**: launched in parallel with Step 1.5 and Step 3A immediately after Step 2 completes — BEFORE the selector has picked its 3 reasons. The generator therefore does not know what Step 3A will choose; instead, it receives the FULL invalidation library and is told to generate reasons that go BEYOND the library categories.
+> **Wave 1**: launched in parallel with Step 1.5, Step 2.5, and Step 3A immediately after Step 2 completes — BEFORE the selector has picked its 2 reasons. The generator therefore does not know what Step 3A will choose; instead, it receives the FULL invalidation library and is told to generate reasons that go BEYOND the library categories.
 >
 > Duplicate filtering against Step 3A's actual selections happens after Wave 1 completes, in the orchestrator (see Step 3B "Filter rule"), before Wave 2 fires.
 
 ```
 Agent(subagent_type="general-purpose", model="opus", prompt="
-You are an Adversarial Invalidation Generator. The issue below survived generic
-invalidation checking. Your job is to find ISSUE-SPECIFIC reasons it might still be invalid.
+You are an Adversarial Invalidation Generator. Your job is to find ISSUE-SPECIFIC reasons
+this issue might be invalid. You run IN PARALLEL with the generic invalidation check — do not
+assume the issue has survived or failed generic checking.
 
 ## Issue Report
 {ISSUE_TEXT}
@@ -555,7 +743,7 @@ SCOPE: Generate invalidation hypotheses only. Do NOT verify them yourself. Retur
 
 ### 4B — Parallel Checkers (part of WAVE 2, fires together with Step 3B)
 
-**Wave 2**: launched in the SAME message as Step 3B's checkers — up to 6 opus agents in parallel. Spawn checkers for the top 3 surviving (post-filter) adversarial reasons by confidence. Same prompt pattern as Step 3B, one agent per reason.
+**Wave 2**: launched in the SAME message as Step 3B's checkers — up to 4 agents in parallel (2 sonnet + 2 opus). Spawn checkers for the top 2 surviving (post-filter) adversarial reasons by confidence. Same prompt pattern as Step 3B, one agent per reason.
 
 Step 4B output is consumed by Step 4C ONLY if Step 3C did not early-exit. If Step 3C early-exits, Step 4B's results are discarded.
 
@@ -612,6 +800,8 @@ SCOPE: Check ONLY your assigned reason. Return verdict and stop.
 
 ### 4C — Neutral Judge (only if Step 3C did NOT early-exit AND any 4B checker returns HOLDS)
 
+**If NO 4B checker returned HOLDS** (all FAILS or UNCERTAIN) → skip Step 4C entirely. Issue is **confirmed VALID** at its current severity. Proceed to Step 4D → OUTPUT.
+
 ```
 Agent(subagent_type="general-purpose", model="opus", prompt="
 You are the Neutral Judge. An adversarial checker has determined that a security issue
@@ -655,19 +845,15 @@ SCOPE: Render your verdict and stop. Do not proceed to other pipeline steps.
 
 ### 4D — Final Severity Assessment (orchestrator inline)
 
-After all Step 4 agents complete:
-1. If neutral judge says `INVALID` → set verdict to `INVALID`.
-2. If neutral judge says `DOWNGRADE` → apply new severity (but not below `MAX_SEVERITY` from Step 2 if set).
-3. If no adversarial reason held, or judge says `VALID` → issue is **confirmed VALID**.
-4. Final severity = `min(original_claimed_severity, MAX_SEVERITY, any_step4_downgrade)`.
-5. If no severity was claimed in the original report → assign severity based on Impact × Likelihood:
-   - **Impact High** + **Likelihood High** = Critical
-   - **Impact High** + **Likelihood Medium** = High
-   - **Impact High** + **Likelihood Low** = Medium
-   - **Impact Medium** + **Likelihood High** = High
-   - **Impact Medium** + **Likelihood Medium** = Medium
-   - **Impact Low** + **Any** = Low
-   - **Informational** = Informational
+> Step 4D collects verdicts from Steps 2, 2.5, and 4C. The canonical severity computation is in **OUTPUT Section A** — Step 4D feeds into it, not the other way around.
+
+After all Step 4 agents complete, gather:
+1. **Judge verdict**: INVALID / DOWNGRADE / VALID from Step 4C (or VALID if 4C was skipped).
+2. **Mitigation check** (if `MITIGATION_CHECK` has returned by now):
+   - `TRADE_OFF` + HIGH confidence → update `MAX_SEVERITY = max(Low, existing MAX_SEVERITY)`. Log: `"Step 2.5: Trade-off detected — severity capped at Low. Downside: {downside_of_fix}"`
+   - `TRADE_OFF` + MEDIUM confidence → log advisory note in pipeline trace only, no cap
+   - `SOLVABLE` / `UNCERTAIN` / not returned → no change
+3. Pass all collected verdicts and `MAX_SEVERITY` to OUTPUT Section A for final computation.
 
 ---
 
@@ -675,12 +861,13 @@ After all Step 4 agents complete:
 
 ### A. Finalize Verdict and Severity
 
-Apply final severity logic (same as Step 4D):
+Apply final severity logic:
 1. If neutral judge (Step 4C) says `INVALID` with HIGH confidence → verdict = `INVALID`. If MEDIUM or LOW confidence → treat as `DOWNGRADE` to Low instead.
-2. If judge says `DOWNGRADE` → apply new severity (but not below `MAX_SEVERITY` from Step 2 if set).
+2. If judge says `DOWNGRADE` → apply new severity (but not below `MAX_SEVERITY` from Step 2/2.5 if set).
 3. If no adversarial reason held, or judge says `VALID` → verdict = `VALID`.
-4. Final severity = `min(original_claimed_severity, MAX_SEVERITY, any_step4_downgrade)`.
-5. If no severity was claimed → assign via Impact × Likelihood matrix:
+4. Apply Step 2.5 mitigation check: if `MITIGATION_CHECK` returned `TRADE_OFF` + HIGH confidence → `MAX_SEVERITY = max(Low, existing MAX_SEVERITY)`. MEDIUM confidence → advisory only. Otherwise → no change.
+5. Final severity = `min(original_claimed_severity, MAX_SEVERITY, any_step4_downgrade)`.
+6. If no severity was claimed → assign via Impact × Likelihood matrix:
    - Impact High + Likelihood High = Critical
    - Impact High + Likelihood Medium = High
    - Impact High + Likelihood Low = Medium
@@ -736,7 +923,8 @@ Full trace format:
 
 ## Pipeline Trace
 - **Step 1 (Initial Sweep)**: {PASSED / FAILED — reason}
-- **Step 2 (Privileged Roles)**: {SKIPPED / DOWNGRADED to Low / NO_ISSUE}
+- **Step 2 (Privileged Roles)**: {SKIPPED / DOWNGRADED to Informational / NO_ISSUE}
+- **Step 2.5 (Mitigation Check)**: {SOLVABLE / TRADE_OFF / UNCERTAIN / TIMEOUT — reason}
 - **Step 3 (Generic Check)**: {N} reasons selected, {M} checked, {K} held, {J} confirmed
 - **Step 4 (Adversarial Check)**: {N} reasons generated, {M} checked, judge: {verdict}
 - **Final Severity**: {severity} {(adjusted from X) if changed}
@@ -796,3 +984,6 @@ In single mode (`INPUT_MODE = single`): skip this step entirely.
 | `validation_notes.md` unreadable mid-batch | Warn, continue with empty BATCH_NOTES for this issue |
 | `SCOPE_FILES` is empty | Text-only analysis; checker code reads return UNCERTAIN |
 | "Other" field empty after file/URL round | Re-prompt once; if still empty, treat as None/skip |
+| Step 2.5 agent times out or fails | Treat as UNCERTAIN, no severity impact |
+| Step 2.5 returns TRADE_OFF with MEDIUM confidence | Advisory note in pipeline trace only; let Step 4C judge weigh it |
+| All Step 4B checkers return FAILS or UNCERTAIN | Skip Step 4C, issue is confirmed VALID |

@@ -1,6 +1,6 @@
 # Invalidation Library — Generic Reasons for Web3 Security Issue Rejection/Downgrade
 
-> **Usage**: The Step 3 Selector Agent reads this file and picks the 5 most applicable reasons for the issue under review. Each reason is self-contained — the agent matches based on the issue's characteristics.
+> **Usage**: The Step 3 Selector Agent reads this file and picks the 2 most applicable reasons for the issue under review. Each reason is self-contained — the agent matches based on the issue's characteristics.
 
 ---
 

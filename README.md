@@ -1,6 +1,6 @@
-# The Judge
+# Judge V1.1
 
-> **Author:** [heavyw8t](https://github.com/heavyw8t)
+> Author: [heavyw8t](https://github.com/heavyw8t)
 
 A high-accuracy false-positive filter for AI-generated web3 security findings, runs each finding through a multi-stage adversarial validation pipeline and returns `VALID`, `INVALID`, or `DOWNGRADED` with evidence.
 
@@ -152,11 +152,12 @@ OUTPUT            Verdict + severity + evidence trace.
 ## Repository Layout
 
 ```
-The-Judge/
+Judge-V1.1/
 ├── README.md
+├── CHANGELOG.md
 ├── skill/
 │   └── judge/
-│       ├── SKILL.md                       ← the methodology, ~800 lines
+│       ├── SKILL.md                       ← the methodology
 │       └── references/
 │           └── invalidation-library.md    ← generic invalidation reason catalog
 └── commands/

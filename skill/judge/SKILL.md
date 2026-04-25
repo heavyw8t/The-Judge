@@ -6,7 +6,7 @@ description: "The Judge — filter AI-generated web3 security findings for false
 # Validate-Issue — Web3 Security Issue Validation Pipeline
 
 > **Purpose**: Determine whether a web3 security issue report is valid, invalid, or should be severity-adjusted through a 4-step adversarial process with early exits.
-> **Models**: opus for generator/adversarial checkers (4B)/judge, sonnet for selector/generic checkers (3B)/mitigation check (2.5)/external research (1.5).
+> **Models**: opus for generator/adversarial checkers (4B)/judge, sonnet for selector/generic checkers (3B)/mitigation check (2.5)/external research (1.5)/severity calibrator (5).
 
 ---
 
@@ -24,18 +24,23 @@ Per-issue pipeline:
     ↓
   WAVE 1:  [STEP 1.5  ∥  STEP 2.5  ∥  STEP 3A  ∥  STEP 4A]  (research + mitigation + selector + generator)
     ↓
-  Orchestrator filters Step 4A reasons against Step 3A selections (drop duplicates)
+  Orchestrator filters Step 4A reasons against Step 3A's 4 selections (drop duplicates)
     ↓
   WAVE 2:  [STEP 3B (2 sonnet) + STEP 4B (2 opus)]       (4 parallel checkers, ONE message)
     ↓
   STEP 3C: orchestrator confirms — EARLY EXIT if ≥2 Step 3B checkers HOLDS
     ↓
-  STEP 4C: judge — only if no 3C exit AND any 4B checker HOLDS
+  STEP 4C: judge — fires on HOLDS, UNCERTAIN, or HIGH-confidence-reason FAILS (symmetric)
+    ↓
+  STEP 4D: orchestrator aggregates verdicts; INVALID short-circuits to OUTPUT
+    ↓
+  STEP 5: severity calibrator — runs on every VALID/DOWNGRADED outcome, sets severity from
+          the verified attack path (independent of claimed severity)
     ↓
   OUTPUT
 ```
 
-Each step can EARLY EXIT with a verdict at Steps 1, 2, or 3C. Step 2.5 runs in background and can cap severity if the issue is a design trade-off.
+Each step can EARLY EXIT with a verdict at Steps 1, 2, or 3C. Step 2.5 runs in background and can cap severity if the issue is a design trade-off. Step 5 only runs for non-INVALID outcomes.
 
 ---
 
@@ -324,8 +329,9 @@ You are a Validate-Issue Per-Issue Agent. Run the per-issue pipeline for ONE iss
 Execute the per-issue pipeline from ~/.claude/agents/skills/judge/SKILL.md
 (or skill/judge/SKILL.md if working locally) for THIS one issue:
 
-  STEP 1 → STEP 2 → WAVE 1 (1.5 ∥ 3A ∥ 4A) → filter → WAVE 2 (3B + 4B in one message)
-    → STEP 3C → STEP 4C (if needed) → OUTPUT
+  STEP 1 → STEP 2 → WAVE 1 (1.5 ∥ 2.5 ∥ 3A ∥ 4A) → filter → WAVE 2 (3B + 4B in one message)
+    → STEP 3C → STEP 4C (symmetric trigger: HOLDS, UNCERTAIN, or rejected HIGH-confidence reason)
+    → STEP 4D → STEP 5 (severity calibrator, only if verdict is VALID or DOWNGRADED) → OUTPUT
 
 You MUST:
 - Spawn checker/generator/judge subagents exactly as the SKILL describes.
@@ -357,7 +363,7 @@ SCOPE: One issue, one output file, return and stop.
 
 - Issues in the SAME batch do not see each other's notes or cache updates. This is acceptable: `BATCH_NOTES` is non-authoritative by design (the rule below), and the cache only affects *later* batches.
 - BATCH_NOTES rule: BATCH_NOTES contains observations and context hints from prior issues — **NOT verdicts**. Do NOT treat a prior note that says an issue is valid/invalid as authoritative. Re-verify any factual claim in BATCH_NOTES against the actual code before relying on it.
-- Each per-issue subagent itself spawns ~7 subagents (4 sonnet + 3 opus worst case). At BATCH_SIZE=5 you have ~15 opus + ~20 sonnet agents in flight simultaneously. Reduce BATCH_SIZE if you hit rate limits.
+- Each per-issue subagent itself spawns up to 8 subagents in the worst case (5 sonnet + 3 opus): Step 1.5, Step 2.5, Step 3A, two Step 3B, Step 4A, two Step 4B, Step 4C, Step 5. Best case is ~5 (when 3C early-exits or 4C is skipped, Step 5 still adds one if not INVALID). At BATCH_SIZE=5 you have ~15 opus + ~25 sonnet agents in flight simultaneously. Reduce BATCH_SIZE if you hit rate limits.
 
 ---
 
@@ -378,9 +384,21 @@ Parse `ISSUE_TEXT` for three required components:
 2. Use `Read` to confirm the referenced function/line exists in that file.
 3. Check that the description is internally consistent (mechanism matches claimed impact).
 
-**Scope check**: When verifying referenced files exist, check against `SCOPE_FILES` first. If a file is referenced but not in `SCOPE_FILES`:
-- If the file exists in the working directory → read it but note "Out-of-scope file referenced" in the pipeline trace.
-- If the file does not exist at all → EARLY EXIT `INVALID`: "Referenced file `{file}` not found in codebase."
+**Scope check**: When verifying referenced files exist, check against `SCOPE_FILES` first. Distinguish two reference roles:
+
+- PRIMARY reference: the file/function cited as the location of the bug (the "Code location" component of the issue, the function whose logic is claimed to be vulnerable).
+- SECONDARY reference: a file mentioned only as an interaction point (e.g., an external contract the in-scope code calls, or a library the vulnerable function relies on).
+
+If a PRIMARY referenced file is out of scope:
+- File exists in the working directory but is NOT in `SCOPE_FILES` → EARLY EXIT `INVALID`: "Primary vulnerability location `{file}` is out of scope. The bug is reported in code that is not part of this audit's scope."
+- File does not exist anywhere → EARLY EXIT `INVALID`: "Referenced file `{file}` not found in codebase."
+
+If only SECONDARY references are out of scope:
+- Read the out-of-scope file as needed for context, but mark it as `OUT_OF_SCOPE_DEPENDENCY` in the pipeline trace.
+- Inject a note into the Step 4A generator and Step 4C judge prompts: *"The issue depends on out-of-scope file(s) `{files}`. The behavior of out-of-scope code is not auditable; treat assumptions about it the way you would treat assumptions about an external protocol — they need evidence (docs, on-chain data) before they can support a HOLDS verdict."*
+- Continue with the pipeline.
+
+If `SCOPE_FILES` is empty (text-only mode, no codebase available) → skip the scope check entirely; the existing "no codebase available" handling below applies.
 
 **EARLY EXIT conditions**:
 - Referenced function does not exist at claimed location → `INVALID` — "Function `{func}` not found in `{file}`."
@@ -393,7 +411,7 @@ On early exit, jump to **OUTPUT** with `EXIT_STEP = 1`.
 
 ## STEP 1.5: External Protocol Research (orchestrator-direct)
 
-> **Wave 1**: launched in parallel with Step 3A AND Step 4A immediately after Step 2 completes. All three fire in the same message.
+> **Wave 1**: launched in parallel with Step 2.5, Step 3A, AND Step 4A immediately after Step 2 completes. All four fire in the same message.
 
 Scan `ISSUE_TEXT` for references to **external protocols** the in-scope code integrates with (e.g., Pendle, Aave, Uniswap, Chainlink, Curve, Lido, Ethena, Compound, MakerDAO, Balancer, etc.).
 
@@ -558,21 +576,27 @@ SCOPE: Evaluate the mitigation only. Return verdict and stop.
 
 ---
 
-## STEP 3: Generic Invalidation Check (1 selector + 2 checkers)
+## STEP 3: Generic Invalidation Check (1 selector + 2 checkers + 2 advisory)
 
 ### 3A — Selector Agent
 
-> **Wave 1**: launched in parallel with Step 1.5 and Step 4A. Sonnet selector reads the invalidation library and picks 2 generic reasons. Does not depend on Step 1.5 or Step 4A output.
+> **Wave 1**: launched in parallel with Step 1.5, Step 2.5, and Step 4A. Sonnet selector reads the invalidation library and picks 4 ranked reasons. Top 2 are checked in Wave 2; bottom 2 are passed to Step 4C as "considered alternatives" if the judge fires. Does not depend on the other Wave 1 outputs.
 
-Spawn one agent to select the 2 most applicable invalidation reasons:
+Spawn one agent to select the 4 most applicable invalidation reasons, ranked by confidence:
 
 ```
 Agent(subagent_type="general-purpose", model="sonnet", prompt="
 You are an Invalidation Selector Agent.
 
 ## Your Task
-Read the invalidation library below and select the 2 reasons MOST APPLICABLE to the
-security issue under review. Do NOT generate new reasons — only select from the library.
+Read the invalidation library below and select the 4 reasons MOST APPLICABLE to the
+security issue under review, ranked from most-likely-to-hold to least. Do NOT generate
+new reasons — only select from the library.
+
+The top 2 of your 4 picks will be verified against the actual code by checker agents.
+The bottom 2 will be shown to the final judge as "considered alternatives" so the judge
+can see what other invalidation pathways were on the table even if they were not directly
+checked. Pick alternatives that are plausibly applicable, not filler.
 
 ## Issue Report
 {ISSUE_TEXT}
@@ -590,23 +614,27 @@ security issue under review. Do NOT generate new reasons — only select from th
 {Read and paste the full content of ~/.claude/agents/skills/judge/references/invalidation-library.md}
 
 ## Output Format
-For each of your 2 selections:
+For each of your 4 selections, ordered from rank 1 (highest confidence) to rank 4:
 ### Selection {N}
+- **Rank**: {1, 2, 3, or 4 — 1 and 2 will be checked, 3 and 4 are advisory only}
 - **ID**: {e.g., CP-2}
 - **Title**: {from library}
+- **Confidence**: HIGH / MEDIUM / LOW
 - **Why this applies**: {2-3 sentences explaining why this specific reason is relevant to THIS issue}
 
-SCOPE: Select 2 reasons from the library. Do NOT verify them against code. Return selections and stop.
+SCOPE: Select 4 reasons from the library, ranked. Do NOT verify them against code. Return selections and stop.
 ")
 ```
 
 ### 3B — Parallel Checkers (part of WAVE 2, fires together with Step 4B)
 
-**After WAVE 1 completes** (Steps 1.5, 3A, and 4A have all returned):
+**After WAVE 1 completes** (Steps 1.5, 2.5, 3A, and 4A have all returned):
 
-1. **Filter Step 4A's reasons against Step 3A's selections.** For each reason from Step 4A, compare against Step 3A's 2 selections. Drop any reason whose mechanism falls into the same vulnerability category as a Step 3A selection (e.g., "missing slippage check" overlaps with library entry CP-2 "input validation"). Keep up to 2 surviving reasons, ranked by the generator's confidence. If Step 4A produced fewer than 2 unique surviving reasons, proceed with what remains (Wave 2 may have <4 agents).
+1. **Split Step 3A's 4 selections.** Take Selections rank 1-2 as `STEP_3A_TOP` (will be checked by 3B). Take Selections rank 3-4 as `STEP_3A_ADVISORY` (passed to Step 4C as considered alternatives, never independently verified).
 
-2. **Launch WAVE 2 in a SINGLE message**: spawn 2 Step 3B checkers (one per Step 3A selection, sonnet) AND up to 2 Step 4B checkers (one per surviving Step 4A reason, opus) — up to 4 agents in parallel.
+2. **Filter Step 4A's reasons against ALL 4 of Step 3A's selections.** For each reason from Step 4A, compare against all 4 selections (top + advisory). Drop any reason whose mechanism falls into the same vulnerability category as ANY Step 3A selection (e.g., "missing slippage check" overlaps with library entry CP-2 "input validation"). Keep up to 2 surviving reasons, ranked by the generator's confidence. If Step 4A produced fewer than 2 unique surviving reasons, proceed with what remains (Wave 2 may have <4 agents).
+
+3. **Launch WAVE 2 in a SINGLE message**: spawn 2 Step 3B checkers (one per `STEP_3A_TOP` selection, sonnet) AND up to 2 Step 4B checkers (one per surviving Step 4A reason, opus) — up to 4 agents in parallel.
 
 Step 3B agents use this prompt (one agent per selected reason):
 
@@ -644,13 +672,32 @@ Determine whether the following invalidation reason HOLDS against the actual cod
 4. Determine your verdict.
 
 ## ANTI-HALLUCINATION RULE (CRITICAL)
-Do NOT make confident claims about external protocol behavior (return values, scaling,
-exchange rates, redemption mechanics) based on your training data. If your verdict depends
-on how an external protocol's function behaves:
-- Use the External Protocol Research above if available — trust it over your assumptions.
-- If no research is available, and you cannot verify the behavior from IN-SCOPE code alone,
-  your verdict MUST be UNCERTAIN, not HOLDS.
-- "I believe Pendle's X always returns Y" is NOT evidence. On-chain data or official docs ARE.
+Numeric and behavioral claims must be grounded in EVIDENCE, not training-data assumptions.
+If your verdict depends on any of the following and you cannot cite a concrete source for it,
+your verdict MUST be UNCERTAIN (not HOLDS, not FAILS):
+
+1. External protocol behavior — return values, scaling, exchange rates, redemption mechanics,
+   slippage curves. Use the External Protocol Research above if available; trust it over your
+   own assumptions. If no research is available and you cannot verify from in-scope code,
+   verdict = UNCERTAIN.
+2. Numeric claims that must be grounded in actual data:
+   - Gas costs ("the attack costs ~50k gas") — must be reasoned from the specific opcodes /
+     storage writes in the code, not asserted.
+   - Real-world DEX liquidity ("the pool has $X liquidity") — requires on-chain data, not
+     a guess.
+   - Token decimals ("USDC is 6 decimals on chain Y") — must reference the actual deployed
+     token at the relevant address. Do not assume; many tokens have non-standard decimals
+     across chains.
+   - Oracle parameters ("Chainlink ETH/USD heartbeat is 3600s") — must reference the actual
+     feed's documented or on-chain configuration.
+   - Fee rates, swap fees, flash-loan fees — must be either documented or read from code.
+3. Market or economic claims ("attacker can move price by X%", "MEV searchers will frontrun
+   this") — must be supported by liquidity data, a documented invariant, or in-scope code.
+
+"I believe X is Y" or "typically Z" is NOT evidence. On-chain data, official docs, code
+citations from in-scope files, or numbers explicitly listed in DOCS_SUMMARY ARE evidence.
+When in doubt: UNCERTAIN. UNCERTAIN does not bias the pipeline toward VALID or INVALID;
+it correctly signals that this checker could not resolve the question.
 
 ## Output Format
 **Reason**: {reason ID and title}
@@ -798,54 +845,106 @@ SCOPE: Check ONLY your assigned reason. Return verdict and stop.
 ")
 ```
 
-### 4C — Neutral Judge (only if Step 3C did NOT early-exit AND any 4B checker returns HOLDS)
+### 4C — Neutral Judge (symmetric trigger)
 
-**If NO 4B checker returned HOLDS** (all FAILS or UNCERTAIN) → skip Step 4C entirely. Issue is **confirmed VALID** at its current severity. Proceed to Step 4D → OUTPUT.
+> Step 4C is the pipeline's final adversarial review. It is intentionally symmetric: it does NOT only fire when the issue looks invalid. It also fires when the result is ambiguous, so that "VALID" is never a default-to-pass outcome.
+
+**Trigger conditions** (Step 4C fires if ANY of the following is true, AND Step 3C did NOT early-exit):
+
+1. **HOLDS path**: at least one Step 4B checker returned `HOLDS`. Run 4C in `MODE = HOLDS_REVIEW` — assess whether the invalidation should result in INVALID or DOWNGRADE.
+2. **CLOSE_CALL path (UNCERTAIN)**: no 4B checker returned HOLDS, but at least one returned `UNCERTAIN`. Run 4C in `MODE = CLOSE_CALL_REVIEW` — the checkers could not resolve at least one reason; the judge must decide whether the issue still holds despite the unresolved doubt.
+3. **CLOSE_CALL path (HIGH-confidence FAIL)**: all 4B checkers returned `FAILS`, but at least one of those reasons was generated by Step 4A with `Confidence: HIGH`. Run 4C in `MODE = CLOSE_CALL_REVIEW` — a checker dismissing a HIGH-confidence generator reason is itself a signal worth a final review.
+
+**Skip 4C only when** all three of: every 4B checker returned `FAILS`, no 4A reason had `Confidence: HIGH`, and Step 3A's advisory selections (rank 3-4) do not contradict the issue. In that case the issue is **confirmed VALID** and proceeds to Step 4D → Step 5 → OUTPUT.
 
 ```
 Agent(subagent_type="general-purpose", model="opus", prompt="
-You are the Neutral Judge. An adversarial checker has determined that a security issue
-should be invalidated or downgraded. You must make the FINAL impartial assessment.
+You are the Neutral Judge. You make the FINAL impartial assessment of whether a security
+issue is VALID, INVALID, or should be DOWNGRADED.
+
+## Mode
+{MODE — one of HOLDS_REVIEW or CLOSE_CALL_REVIEW}
+
+- HOLDS_REVIEW: at least one adversarial checker concluded the issue should be invalidated
+  or downgraded. Your job is to verify their reasoning and decide the verdict.
+- CLOSE_CALL_REVIEW: no single checker reached HOLDS, but the verdict is not clean. Either
+  a checker returned UNCERTAIN (could not resolve), or a HIGH-confidence generator reason
+  was rejected by a checker. Your job is to decide, on the evidence, whether the issue
+  genuinely holds OR whether the cumulative weight of partial invalidations justifies a
+  DOWNGRADE or INVALID.
 
 ## Issue Report
 {ISSUE_TEXT}
 
-## Proposed Invalidation
-**Reason**: {reason title}
-**Checker Evidence**: {full evidence from checker agent}
-**Checker Verdict**: HOLDS
-**Severity Impact**: {from checker}
+## Step 4B Checker Outcomes (full evidence + verdict for each adversarial reason)
+{ALL_4B_RESULTS — verdict, evidence, explanation, severity impact for each reason}
+
+## Step 3A Advisory Selections (rank 3-4, considered but not independently verified)
+{STEP_3A_ADVISORY — for each: ID, title, why-this-applies. Use as context for what other
+invalidation pathways were on the table. Do NOT treat as confirmed; they were not checked.}
 
 ## Protocol Documentation
 {DOCS_SUMMARY}
 
+## External Protocol Research (from Step 1.5)
+{EXTERNAL_RESEARCH or "No external protocol research was conducted."}
+
+## Out-of-Scope Notes (from Step 1)
+{OUT_OF_SCOPE_NOTE or "All referenced files are in scope."}
+
 ## Instructions
 1. Read the original issue report carefully and understand the claimed attack.
-2. Read the checker's evidence and trace their logic.
+2. Read every 4B checker's evidence — both HOLDS and FAILS and UNCERTAIN. The pattern of
+   UNCERTAIN responses tells you where the evidence is genuinely ambiguous.
 3. Independently read the relevant source code.
-4. Seek counterarguments: is there a way the attack still works despite this reason?
-5. Also seek design-intent arguments: is the described behavior intentional? Check NatSpec, docs, and calling context.
-6. Render your final verdict impartially — do not bias toward VALID or INVALID. Follow the evidence.
+4. Seek counterarguments: is there a way the attack still works despite the strongest
+   invalidation reason?
+5. Seek design-intent arguments: is the described behavior intentional? Check NatSpec,
+   docs, and calling context.
+6. Consider Step 3A's advisory selections — were any of them in fact correct, even though
+   they were not directly checked?
+7. Render your final verdict impartially. Do NOT bias toward VALID. Do NOT bias toward INVALID.
+   Follow the evidence.
+
+## ANTI-HALLUCINATION RULE (CRITICAL)
+Numeric and behavioral claims must be grounded in EVIDENCE, not training-data assumptions.
+The same rule applies to your final verdict: if your reasoning depends on a numeric claim
+(gas cost, oracle heartbeat, token decimals, DEX liquidity, fee rate) or external protocol
+behavior that you cannot cite from in-scope code, DOCS_SUMMARY, or External Protocol Research,
+you must NOT use it as a load-bearing argument. Either find the evidence and cite it, or
+do not rely on the claim. If the issue's verdict materially depends on an unverifiable
+numeric claim made by the report itself, that is itself grounds for DOWNGRADE (the report
+fails its own evidence burden).
 
 ## Balanced Standard
-- INVALID: the invalidation reason clearly holds AND there is no plausible way the issue manifests despite it.
-- DOWNGRADE: the issue is real but the invalidation reason significantly limits severity or scope.
-- VALID: the invalidation reason does not hold or is insufficient to negate the issue.
-- Apply your best judgment. Do not default to VALID out of caution — a well-evidenced INVALID is correct.
+- INVALID: the invalidation reason(s) clearly hold AND there is no plausible way the issue
+  manifests despite them. In CLOSE_CALL_REVIEW mode, INVALID requires that the cumulative
+  weight of partial invalidations renders the issue effectively non-exploitable.
+- DOWNGRADE: the issue is real but invalidation reasons or design constraints significantly
+  limit severity or scope.
+- VALID: invalidation reasons do not hold or are insufficient to negate the issue. In
+  CLOSE_CALL_REVIEW mode, VALID requires that the unresolved doubts (UNCERTAIN verdicts)
+  do not change the conclusion that the attack works.
+
+Apply your best judgment. Do not default to VALID out of caution — a well-evidenced INVALID
+is correct. Do not default to INVALID out of skepticism — a well-evidenced VALID is correct.
 
 ## Output Format
-**Final Verdict**: VALID (issue is real, invalidation reason does not hold) / INVALID (issue should be rejected) / DOWNGRADE (severity should be lowered)
+**Mode**: {HOLDS_REVIEW or CLOSE_CALL_REVIEW}
+**Final Verdict**: VALID / INVALID / DOWNGRADE
 **If DOWNGRADE, New Severity**: Critical / High / Medium / Low / Informational
-**Justification**: {5-10 sentences, detailed reasoning}
+**Justification**: {5-10 sentences, detailed reasoning. In CLOSE_CALL_REVIEW mode, explicitly
+address what the UNCERTAIN verdicts or rejected HIGH-confidence reasons signaled and why
+that did or did not change your conclusion.}
 **Confidence**: HIGH / MEDIUM / LOW
 
 SCOPE: Render your verdict and stop. Do not proceed to other pipeline steps.
 ")
 ```
 
-### 4D — Final Severity Assessment (orchestrator inline)
+### 4D — Verdict Aggregation (orchestrator inline)
 
-> Step 4D collects verdicts from Steps 2, 2.5, and 4C. The canonical severity computation is in **OUTPUT Section A** — Step 4D feeds into it, not the other way around.
+> Step 4D aggregates verdicts from Steps 2, 2.5, and 4C. It does NOT compute severity directly — Step 5 (if it fires) and OUTPUT Section A own that.
 
 After all Step 4 agents complete, gather:
 1. **Judge verdict**: INVALID / DOWNGRADE / VALID from Step 4C (or VALID if 4C was skipped).
@@ -853,7 +952,125 @@ After all Step 4 agents complete, gather:
    - `TRADE_OFF` + HIGH confidence → update `MAX_SEVERITY = max(Low, existing MAX_SEVERITY)`. Log: `"Step 2.5: Trade-off detected — severity capped at Low. Downside: {downside_of_fix}"`
    - `TRADE_OFF` + MEDIUM confidence → log advisory note in pipeline trace only, no cap
    - `SOLVABLE` / `UNCERTAIN` / not returned → no change
-3. Pass all collected verdicts and `MAX_SEVERITY` to OUTPUT Section A for final computation.
+3. Determine `PRELIM_VERDICT`:
+   - If Step 4C says INVALID with HIGH confidence → `PRELIM_VERDICT = INVALID`
+   - If Step 4C says INVALID with MEDIUM/LOW confidence → `PRELIM_VERDICT = DOWNGRADED` (treat as a low-conviction invalidation; convert to a downgrade for Step 5 to grade)
+   - If Step 4C says DOWNGRADE → `PRELIM_VERDICT = DOWNGRADED` and remember `JUDGE_DOWNGRADE_TARGET` (the severity the judge proposed)
+   - If Step 4C says VALID, or Step 4C was skipped → `PRELIM_VERDICT = VALID`
+4. If `PRELIM_VERDICT = INVALID` → skip Step 5, jump straight to OUTPUT (severity is N/A for invalid issues).
+5. Otherwise (VALID or DOWNGRADED) → proceed to **Step 5: Severity Calibrator**.
+
+---
+
+## STEP 5: Severity Calibrator (orchestrator-direct, post-verdict)
+
+> Step 5 fires only when `PRELIM_VERDICT ∈ {VALID, DOWNGRADED}`. It runs once per issue, sequentially, after Step 4D. It produces an INDEPENDENT severity assessment from the verified attack path — it is not bound by the original claimed severity. This addresses the asymmetry where the previous pipeline could only downgrade severity, never correctly upgrade or recalibrate it.
+
+**Why this exists**: An issue filed as Medium may, on inspection, allow direct theft of arbitrary user funds (Critical). An issue filed as Critical may, on inspection, only affect the attacker's own balance (Informational). The previous `min(claimed, MAX_SEVERITY, downgrade)` logic could not correct under-grading. Step 5 sets severity from the evidence, then OUTPUT Section A clamps it against the Step 2 / Step 2.5 caps.
+
+**Build the calibrator input** from pipeline state:
+
+```
+ATTACK_PATH_SUMMARY = orchestrator-built summary, ≤200 words, covering:
+  - The attack precondition (state required, role required, market conditions required)
+  - The mechanism (what call sequence triggers the bug)
+  - The direct effect (what state changes, what value moves)
+  - The harmed party (whose funds, whose access, whose state)
+  - Anything Step 4C concluded about the attack's boundaries (downgrade reason if any)
+  - Anything Step 2.5 concluded about mitigation cost (trade-off vs solvable)
+```
+
+**Spawn agent**:
+
+```
+Agent(subagent_type="general-purpose", model="sonnet", prompt="
+You are the Severity Calibrator. The pipeline has determined that a security issue is
+real (verdict = VALID or DOWNGRADED). Your job is to assign severity INDEPENDENTLY of the
+severity the report originally claimed, based purely on the verified attack path.
+
+## Verified Attack Path
+{ATTACK_PATH_SUMMARY}
+
+## Original Issue Report (for reference, NOT for severity anchoring)
+{ISSUE_TEXT}
+
+## Pipeline-Derived Findings
+- **Pipeline verdict**: {PRELIM_VERDICT}
+- **Judge's downgrade target (if any)**: {JUDGE_DOWNGRADE_TARGET or 'None'}
+- **MAX_SEVERITY caps applied (informational only — the orchestrator will re-clamp afterwards)**:
+  {list of caps from Step 2 (trusted role) and Step 2.5 (trade-off) with their reasons}
+- **Out-of-scope dependencies (if any)**: {OUT_OF_SCOPE_NOTE}
+
+## Protocol Documentation
+{DOCS_SUMMARY}
+
+## Roles Summary
+{ROLES_SUMMARY}
+
+## Your Task
+Score severity from the verified attack path using the rubric below. Do NOT anchor on the
+report's claimed severity — many reports under-grade or over-grade. Anchor on what the
+attack actually does.
+
+## Severity Rubric
+
+CRITICAL — direct, unconditional theft or loss of user funds, OR permanent freeze of
+material funds, OR catastrophic protocol-level invariant break (e.g., infinite mint, total
+collateral can be drained). Attack does not require unrealistic preconditions.
+
+HIGH — theft or loss of user funds requires non-trivial but realistic preconditions
+(e.g., specific market state, victim must perform a normal action, attacker needs modest
+capital), OR temporary freeze of material funds, OR significant protocol-level invariant
+break that propagates to user impact.
+
+MEDIUM — material harm to a subset of users under specific conditions, OR loss bounded by
+a parameter or rate limit, OR loss requires victim error / non-default usage, OR theft of
+fees / yield (not principal) under realistic conditions, OR DoS of an important function
+that has a viable workaround.
+
+LOW — small economic harm (rounding, dust accumulation), OR griefing with high attacker
+cost relative to victim cost, OR DoS of a non-critical function, OR informational-leak
+issues with minor consequences.
+
+INFORMATIONAL — no economic harm, OR self-harm only, OR purely cosmetic, OR a recommendation
+without a concrete attack, OR the issue is a known design trade-off where any fix has
+equivalent downside.
+
+## ANTI-HALLUCINATION RULE (CRITICAL)
+Numeric and behavioral claims must be grounded in EVIDENCE. If your severity grade depends
+on a numeric claim (gas cost, oracle heartbeat, token decimals, DEX liquidity, fee rate)
+or external protocol behavior that you cannot cite from in-scope code, DOCS_SUMMARY, or
+the verified attack path, you must NOT use it as a load-bearing argument. Pick the more
+conservative grade when an unverified numeric would otherwise push severity higher.
+
+## Reasoning Discipline
+- Identify the harmed party explicitly (which user, which role).
+- Identify the attacker's required capital and required preconditions explicitly.
+- If the attack only harms the attacker themselves → INFORMATIONAL regardless of the
+  technical sophistication.
+- If the attack requires a trusted admin to act maliciously → defer to MAX_SEVERITY cap;
+  the orchestrator will re-apply Step 2's cap, but flag in your reasoning.
+- If the attack is a design trade-off where any fix has equivalent downside → INFORMATIONAL
+  or LOW; the orchestrator will re-apply Step 2.5's cap.
+
+## Output Format
+**Calibrated Severity**: Critical / High / Medium / Low / Informational
+**Confidence**: HIGH / MEDIUM / LOW
+**Justification**: {3-6 sentences. State the harmed party, the precondition, the mechanism,
+and which rubric tier matches. If you are diverging from the original claimed severity by
+more than one tier, explicitly say so and justify why.}
+**Divergence from Claim**: {NONE / 1-tier / 2-tier / 3+-tier} — and direction (UPGRADED /
+DOWNGRADED) if non-zero.
+
+SCOPE: Calibrate severity from the verified attack path. Return and stop.
+")
+```
+
+**Result variable**: store the agent result as `CALIBRATED_SEVERITY`, `CALIBRATION_CONFIDENCE`, `CALIBRATION_JUSTIFICATION`, `SEVERITY_DIVERGENCE`. Pass these into OUTPUT Section A.
+
+**Result handling**:
+- If the calibrator times out or fails → log "Step 5: calibrator failed, falling back to legacy severity logic" and proceed to OUTPUT Section A using the prior `min(claimed, MAX_SEVERITY, judge_downgrade)` logic as fallback.
+- If `CALIBRATION_CONFIDENCE = LOW` AND `SEVERITY_DIVERGENCE ≥ 2-tier` → log a `SEVERITY_DIVERGENCE_WARNING` in the pipeline trace; the calibrated severity still applies, but the trace flags it for human review.
 
 ---
 
@@ -861,20 +1078,32 @@ After all Step 4 agents complete, gather:
 
 ### A. Finalize Verdict and Severity
 
-Apply final severity logic:
-1. If neutral judge (Step 4C) says `INVALID` with HIGH confidence → verdict = `INVALID`. If MEDIUM or LOW confidence → treat as `DOWNGRADE` to Low instead.
-2. If judge says `DOWNGRADE` → apply new severity (but not below `MAX_SEVERITY` from Step 2/2.5 if set).
-3. If no adversarial reason held, or judge says `VALID` → verdict = `VALID`.
-4. Apply Step 2.5 mitigation check: if `MITIGATION_CHECK` returned `TRADE_OFF` + HIGH confidence → `MAX_SEVERITY = max(Low, existing MAX_SEVERITY)`. MEDIUM confidence → advisory only. Otherwise → no change.
-5. Final severity = `min(original_claimed_severity, MAX_SEVERITY, any_step4_downgrade)`.
-6. If no severity was claimed → assign via Impact × Likelihood matrix:
-   - Impact High + Likelihood High = Critical
-   - Impact High + Likelihood Medium = High
-   - Impact High + Likelihood Low = Medium
-   - Impact Medium + Likelihood High = High
-   - Impact Medium + Likelihood Medium = Medium
-   - Impact Low + Any = Low
-   - Informational = Informational
+The verdict is already determined by Step 4D's `PRELIM_VERDICT`. The severity is determined primarily by Step 5's `CALIBRATED_SEVERITY`, then clamped against caps from Steps 2 and 2.5.
+
+**Verdict**:
+- `PRELIM_VERDICT = INVALID` → final verdict = `INVALID`, severity = `N/A`. Skip remaining severity logic.
+- `PRELIM_VERDICT = DOWNGRADED` → final verdict = `DOWNGRADED`. Severity is set below.
+- `PRELIM_VERDICT = VALID` → final verdict = `VALID`. Severity is set below.
+
+**Severity** (only for non-INVALID verdicts):
+1. Start with `final_severity = CALIBRATED_SEVERITY` from Step 5.
+2. Apply caps (severity cannot exceed any active cap):
+   - If Step 2 set `MAX_SEVERITY = Informational` (trusted-role cap) → `final_severity = min(final_severity, Informational)`
+   - If Step 2.5 set `MAX_SEVERITY = Low` (trade-off cap) → `final_severity = min(final_severity, Low)`
+3. If verdict is `DOWNGRADED` AND `JUDGE_DOWNGRADE_TARGET` is set AND `JUDGE_DOWNGRADE_TARGET` is stricter than `final_severity` → `final_severity = JUDGE_DOWNGRADE_TARGET`. (The judge can still pull severity down further than the calibrator if it found a specific bounding constraint the calibrator missed.)
+4. Compute `SEVERITY_DIVERGENCE` for the trace: compare `final_severity` to `original_claimed_severity` (if any). Mark as `UPGRADED`, `DOWNGRADED`, or `CONFIRMED`.
+
+**Fallback path** (Step 5 failed or was skipped due to error): use the legacy logic:
+- Final severity = `min(original_claimed_severity, MAX_SEVERITY, JUDGE_DOWNGRADE_TARGET)`.
+- If no severity was claimed → assign via Impact × Likelihood matrix:
+  - Impact High + Likelihood High = Critical
+  - Impact High + Likelihood Medium = High
+  - Impact High + Likelihood Low = Medium
+  - Impact Medium + Likelihood High = High
+  - Impact Medium + Likelihood Medium = Medium
+  - Impact Low + Any = Low
+  - Informational = Informational
+- Tag the trace with `Step 5: FALLBACK` so the human reviewer knows the calibrator did not run.
 
 ### B. If OUTPUT_MODE = console (single issue)
 
@@ -903,7 +1132,8 @@ Full trace format:
 **Verdict**: VALID / INVALID / DOWNGRADED
 **Final Severity**: Critical / High / Medium / Low / Informational / N/A
 **Original Claimed Severity**: {from report, or "Not specified"}
-**Pipeline Exit Point**: Step {1|2|3|4}
+**Severity Divergence**: CONFIRMED / UPGRADED 1-tier / UPGRADED 2-tier / DOWNGRADED 1-tier / DOWNGRADED 2-tier / DOWNGRADED 3+-tier / N/A
+**Pipeline Exit Point**: Step {1|2|3|4|5}
 **Confidence**: HIGH / MEDIUM / LOW
 
 ## Summary
@@ -922,12 +1152,13 @@ Full trace format:
 | ... | | | | |
 
 ## Pipeline Trace
-- **Step 1 (Initial Sweep)**: {PASSED / FAILED — reason}
+- **Step 1 (Initial Sweep)**: {PASSED / FAILED — reason. If applicable: PRIMARY out-of-scope file → INVALID, or SECONDARY out-of-scope dependency → flagged}
 - **Step 2 (Privileged Roles)**: {SKIPPED / DOWNGRADED to Informational / NO_ISSUE}
 - **Step 2.5 (Mitigation Check)**: {SOLVABLE / TRADE_OFF / UNCERTAIN / TIMEOUT — reason}
-- **Step 3 (Generic Check)**: {N} reasons selected, {M} checked, {K} held, {J} confirmed
-- **Step 4 (Adversarial Check)**: {N} reasons generated, {M} checked, judge: {verdict}
-- **Final Severity**: {severity} {(adjusted from X) if changed}
+- **Step 3 (Generic Check)**: 4 reasons selected (rank 1-4), top 2 checked, {K} held, {J} confirmed; rank 3-4 passed to judge as advisory
+- **Step 4 (Adversarial Check)**: {N} reasons generated, {M} checked, judge mode: {HOLDS_REVIEW / CLOSE_CALL_REVIEW / SKIPPED}, judge verdict: {verdict}
+- **Step 5 (Severity Calibrator)**: {Calibrated severity, confidence, divergence direction, or FALLBACK / SKIPPED if INVALID}
+- **Final Severity**: {severity} {(calibrated from X claimed; clamped by caps Y if applicable)}
 ```
 
 ### C. If OUTPUT_MODE = files (CSV batch)
@@ -986,4 +1217,11 @@ In single mode (`INPUT_MODE = single`): skip this step entirely.
 | "Other" field empty after file/URL round | Re-prompt once; if still empty, treat as None/skip |
 | Step 2.5 agent times out or fails | Treat as UNCERTAIN, no severity impact |
 | Step 2.5 returns TRADE_OFF with MEDIUM confidence | Advisory note in pipeline trace only; let Step 4C judge weigh it |
-| All Step 4B checkers return FAILS or UNCERTAIN | Skip Step 4C, issue is confirmed VALID |
+| All Step 4B checkers return FAILS, no HIGH-confidence 4A reason existed | Skip Step 4C, issue is confirmed VALID |
+| Any Step 4B checker returns UNCERTAIN | Fire Step 4C in CLOSE_CALL_REVIEW mode |
+| All Step 4B checkers FAIL but a HIGH-confidence 4A reason was rejected | Fire Step 4C in CLOSE_CALL_REVIEW mode |
+| PRIMARY referenced file is out of scope | Step 1 EARLY EXIT: INVALID with "out of scope" reason |
+| SECONDARY out-of-scope dependency only | Continue pipeline; inject `OUT_OF_SCOPE_NOTE` into 4A and 4C prompts |
+| Step 5 calibrator times out or fails | Log "Step 5: FALLBACK"; use legacy `min(claimed, MAX_SEVERITY, judge_downgrade)` logic |
+| Step 5 calibration diverges 2+ tiers from claimed with LOW confidence | Apply calibrated severity but tag trace `SEVERITY_DIVERGENCE_WARNING` for human review |
+| Step 5 skipped because verdict = INVALID | Severity = N/A; final verdict stands as INVALID |

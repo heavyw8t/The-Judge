@@ -1,6 +1,38 @@
 # Changelog
 
-All notable changes to The Judge skill are documented in this file.
+All notable changes to Judge V1.1 are documented in this file.
+
+---
+
+## [1.1] - 2026-04-25
+
+V1.1 adds two new pipeline stages on top of V0: a mitigation viability check that caps design trade-off issues at Low, and a post-verdict severity calibrator that re-grades from the verified attack path so under-graded findings can be upgraded, not only downgraded. The Step 4C judge now fires symmetrically (on HOLDS, UNCERTAIN, or rejected high-confidence reasons), and the anti-hallucination guard covers all numeric claims (gas, liquidity, decimals, oracles, fees), not just external protocol behavior. PRE-STEP auto-detects docs, scope, and roles across Solidity, Solana, and Move, and Step 1 rejects primary out-of-scope findings before the pipeline runs.
+
+Per-version detail in entries 0.2 through 0.4 below.
+
+---
+
+## [0.4] - 2026-04-25
+
+### Added
+- Step 5: Severity Calibrator (sonnet, sequential, post-verdict). Runs on every VALID or DOWNGRADED outcome and computes severity independently from the verified attack path, using a structured rubric (Critical → Informational tiers anchored on harmed party, precondition realism, and effect type). Replaces the previous `min(claimed, MAX_SEVERITY, judge_downgrade)` logic, which could only ratchet severity downward and therefore could not correct under-graded reports. Step 2 (trusted role) and Step 2.5 (trade-off) caps still apply on top of the calibrated severity.
+- Step 4C close-call mode: judge now fires symmetrically. In addition to the existing HOLDS path, the judge also fires when any 4B checker returns UNCERTAIN (no clean rejection of the issue) or when all 4B checkers FAIL but a HIGH-confidence 4A reason was rejected. Adds a new `MODE` field (HOLDS_REVIEW / CLOSE_CALL_REVIEW) to the judge prompt and reasoning.
+- Step 3A advisory selections: selector now picks 4 ranked reasons (was 2). Top 2 are checked by 3B; ranks 3-4 are passed to the Step 4C judge as "considered alternatives" so the judge sees what other invalidation pathways were on the table even though they were not directly verified. The Step 4A duplicate filter compares against all 4 selections.
+- Step 1 PRIMARY vs SECONDARY out-of-scope distinction: a primary reference (the file/function cited as the bug location) being out of scope now triggers an early INVALID exit. Secondary references (interaction points the in-scope code calls) continue the pipeline but inject an `OUT_OF_SCOPE_NOTE` into the 4A and 4C prompts so reasoning about them is held to the same evidence standard as external protocols.
+- Severity divergence reporting: trace now includes a `Severity Divergence` field (CONFIRMED / UPGRADED N-tier / DOWNGRADED N-tier) and a `SEVERITY_DIVERGENCE_WARNING` tag when the calibrator diverges 2+ tiers from the claimed severity with LOW confidence, surfacing borderline calls for human review.
+
+### Changed
+- Anti-hallucination rule (3B, 4B, and now 4C and Step 5) broadened from "external protocol behavior only" to also cover numeric claims that cannot be derived from in-scope code or `DOCS_SUMMARY`: gas costs, real-world DEX liquidity, token decimals at specific deployments, oracle heartbeat / deviation thresholds, and fee rates. Verdicts depending on unverifiable numerics must return UNCERTAIN. Step 5 picks the more conservative grade when an unverified numeric would otherwise push severity higher; Step 4C may DOWNGRADE if the report itself relies on an unverifiable numeric.
+- Pipeline overview diagram updated to include Step 4D (verdict aggregation) and Step 5, and to describe the Step 4C trigger as symmetric.
+- Step 4D renamed from "Final Severity Assessment" to "Verdict Aggregation". Step 4D no longer computes severity; it determines `PRELIM_VERDICT` and routes to Step 5 (or to OUTPUT directly if INVALID).
+- OUTPUT Section A rewritten: severity is `CALIBRATED_SEVERITY` clamped against active caps, with a fallback to legacy `min(...)` logic if Step 5 fails. Pipeline trace template adds Step 5 line and exit-point now ranges 1-5.
+- CSV per-issue subagent prompt updated to include Step 2.5 (was missing from step list) and Step 5; Wave 1 reference now correctly mentions all four parallel agents.
+- Worst-case agent count per issue documented as up to 8 (was 7), reflecting Step 5 addition.
+- Invalidation library header updated from "picks the 2" to "picks the 4 (ranked); top 2 verified, bottom 2 advisory to judge".
+
+### Fixed
+- Step 1.5 wave-reference text now lists all four Wave 1 agents (1.5, 2.5, 3A, 4A); previously omitted 2.5.
+- Step 3 section header count corrected: "1 selector + 2 checkers + 2 advisory" (was "1 selector + 2 checkers"), reflecting that ranks 3-4 now have a defined downstream consumer.
 
 ---
 
